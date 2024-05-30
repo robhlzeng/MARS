@@ -1,14 +1,20 @@
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from pointnet2_ops.pointnet2_modules import PointnetFPModule, PointnetSAModule
+import numpy as np
+import sys
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+sys.path.append(ROOT_DIR)
+sys.path.append(os.path.join(ROOT_DIR, 'pointnet2'))
+from pointnet2.pointnet2_modules import PointnetSAModuleVotes, PointnetFPModule
 
 
 class Residual(nn.Module):
     expansion = 1
 
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, map_shape, stride=1):
         super(Residual, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
@@ -87,7 +93,7 @@ class Pointnet2Backbone(nn.Module):
     def __init__(self, input_feature_dim=0):
         super(Pointnet2Backbone, self).__init__()
 
-        self.SA1 = PointnetSAModule(
+        self.SA1 = PointnetSAModuleVotes(
             npoint=512,
             radius=0.1,
             nsample=64,

@@ -6,7 +6,11 @@ In this work, we introduce MARS, a novel framework for articulated object charac
  <img src="./figure/net.png" width = "666"  align=center />
 </div>
 
-## Code coming soon
+## Installation
+```
+cd pointnet2
+python setup.py install
+```
 
 ## Reference
 
