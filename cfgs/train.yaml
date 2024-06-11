@@ -1,7 +1,7 @@
 optimizer: {
   type: AdamW,
   kwargs: {
-  lr: 0.001,
+  lr: 0.0001,
   weight_decay: 0.05}}
 
 scheduler: {
@@ -9,3 +9,28 @@ scheduler: {
   kwargs: {
     epochs: 300,
     initial_epochs: 10}}
+
+dataset : {
+  train: { _base_: cfgs/dataset_configs/PartNet_Mobility.yaml,
+           others: {subset: 'train', data_type: 'Revolute', head_type: 'Para', img_size: 224}},
+  val : { _base_: cfgs/dataset_configs/PartNet_Mobility.yaml,
+            others: {subset: 'val', data_type: 'Revolute', head_type: 'Para', img_size: 224}},
+  test : { _base_: cfgs/dataset_configs/PartNet_Mobility.yaml,
+            others: {subset: 'test', data_type: 'Revolute', head_type: 'Para', img_size: 224}}}
+
+
+model: {
+  NAME: MFFP,
+  point_set: [512, 128, 64, 16],
+  vote_num: 128,
+  embed_dim: 512,
+  train_head: 'Para',
+  joint_type: 'Revolute',
+  depth: 6,
+  num_heads: 8,
+  drop_path_rate: 0.1
+}
+
+total_bs: 128
+step_per_update: 1
+max_epoch: 300

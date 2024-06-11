@@ -1,175 +1,169 @@
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-import numpy as np
-import sys
+import torch.nn.functional as F
 import os
+import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BASE_DIR)
-sys.path.append(ROOT_DIR)
-sys.path.append(os.path.join(ROOT_DIR, 'pointnet2'))
-from pointnet2.pointnet2_modules import PointnetSAModuleVotes, PointnetFPModule
+sys.path.append(BASE_DIR)
+
+from pointnet2_ops import pointnet2_utils
+import pytorch_utils as pt_utils
+from typing import List
 
 
-class Residual(nn.Module):
-    expansion = 1
+class PointnetSAModuleVotes(nn.Module):
+    ''' Modified based on _PointnetSAModuleBase and PointnetSAModuleMSG
+    with extra support for returning point indices for getting their GT votes '''
 
-    def __init__(self, in_channels, out_channels, map_shape, stride=1):
-        super(Residual, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+    def __init__(
+            self,
+            *,
+            mlp: List[int],
+            npoint: int = None,
+            radius: float = None,
+            nsample: int = None,
+            bn: bool = True,
+            use_xyz: bool = True,
+            pooling: str = 'max',
+            sigma: float = None, # for RBF pooling
+            normalize_xyz: bool = False, # noramlize local XYZ with radius
+            sample_uniformly: bool = False,
+            ret_unique_cnt: bool = False
+    ):
+        super().__init__()
 
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.npoint = npoint
+        self.radius = radius
+        self.nsample = nsample
+        self.pooling = pooling
+        self.mlp_module = None
+        self.use_xyz = use_xyz
+        self.sigma = sigma
+        if self.sigma is None:
+            self.sigma = self.radius/2
+        self.normalize_xyz = normalize_xyz
+        self.ret_unique_cnt = ret_unique_cnt
 
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
+        if npoint is not None:
+            self.grouper = pointnet2_utils.QueryAndGroup(radius, nsample,
+                use_xyz=use_xyz, ret_grouped_xyz=True, normalize_xyz=normalize_xyz,
+                sample_uniformly=sample_uniformly, ret_unique_cnt=ret_unique_cnt)
+        else:
+            self.grouper = pointnet2_utils.GroupAll(use_xyz, ret_grouped_xyz=True)
 
-    def forward(self, inputs):
-        identity = inputs
-        out = F.relu(self.bn1(self.conv1(inputs)))
-        out = self.bn2(self.conv2(out))
-        out += self.downsample(identity)
-
-        return F.relu(out)
-
-
-class ResNet18(nn.Module):
-    def __init__(self, features_dim=1000):
-        super(ResNet18, self).__init__()
-
-        self.Layer1 = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        )
-
-        self.Layer2 = self._make_layer(64, 64, 2, 56, stride=1)
-        self.Layer3 = self._make_layer(64, 128, 2, 28, stride=2)
-        self.Layer4 = self._make_layer(128, 256, 2, 14, stride=2)
-        self.Layer5 = self._make_layer(256, 512, 2, 7, stride=2)
-
-        self.Avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.flatten = nn.Flatten()
-        self.Fc = nn.Linear(512, features_dim)
-
-    def _make_layer(self, in_channels, out_channels, blocks, map_shape, stride):
-        layers = [Residual(in_channels, out_channels, map_shape, stride)]
-        for _ in range(1, blocks):
-            layers.append(Residual(out_channels, out_channels, map_shape, 1))
-        return nn.Sequential(*layers)
-
-    def forward(self, imgs:torch.cuda.FloatTensor, end_imgs=None):
-        if not end_imgs: end_imgs = {}
-        features = self.Layer1(imgs)
-        end_imgs['Layer1_features'] = features
-
-        features = self.Layer2(features)
-        end_imgs['Layer2_features'] = features
-
-        features = self.Layer3(features)
-        end_imgs['Layer3_features'] = features
-
-        features = self.Layer4(features)
-        end_imgs['Layer4_features'] = features
-
-        features = self.Layer5(features)
-        end_imgs['Layer5_features'] = features
-
-        features = self.Avgpool(features)
-        features = self.flatten(features)
-        features = self.Fc(features)
-        end_imgs['features'] = features
-        return end_imgs
+        mlp_spec = mlp
+        if use_xyz and len(mlp_spec)>0:
+            mlp_spec[0] += 3
+        self.mlp_module = pt_utils.SharedMLP(mlp_spec, bn=bn)
 
 
-class Pointnet2Backbone(nn.Module):
-    def __init__(self, input_feature_dim=0):
-        super(Pointnet2Backbone, self).__init__()
+    def forward(self, xyz: torch.Tensor,
+                features: torch.Tensor = None,
+                inds: torch.Tensor = None) -> (torch.Tensor, torch.Tensor):
+        r"""
+        Parameters
+        ----------
+        xyz : torch.Tensor
+            (B, N, 3) tensor of the xyz coordinates of the features
+        features : torch.Tensor
+            (B, C, N) tensor of the descriptors of the the features
+        inds : torch.Tensor
+            (B, npoint) tensor that stores index to the xyz points (values in 0-N-1)
 
-        self.SA1 = PointnetSAModuleVotes(
-            npoint=512,
-            radius=0.1,
-            nsample=64,
-            mlp=[input_feature_dim, 32, 32, 64],
-            use_xyz=True,
-            normalize_xyz=True
-        )
+        Returns
+        -------
+        new_xyz : torch.Tensor
+            (B, npoint, 3) tensor of the new features' xyz
+        new_features : torch.Tensor
+            (B, \sum_k(mlps[k][-1]), npoint) tensor of the new_features descriptors
+        inds: torch.Tensor
+            (B, npoint) tensor of the inds
+        """
 
-        self.SA2 = PointnetSAModuleVotes(
-            npoint=128,
-            radius=0.2,
-            nsample=32,
-            mlp=[64, 64, 64, 128],
-            use_xyz=True,
-            normalize_xyz=True
-        )
+        xyz_flipped = xyz.transpose(1, 2).contiguous()
+        if inds is None:
+            inds = pointnet2_utils.furthest_point_sample(xyz, self.npoint)
+        else:
+            assert(inds.shape[1] == self.npoint)
+        new_xyz = pointnet2_utils.gather_operation(
+            xyz_flipped, inds
+        ).transpose(1, 2).contiguous() if self.npoint is not None else None
 
-        self.SA3 = PointnetSAModuleVotes(
-            npoint=64,
-            radius=0.4,
-            nsample=32,
-            mlp=[128, 128, 128, 256],
-            use_xyz=True,
-            normalize_xyz=True
-        )
+        if not self.ret_unique_cnt:
+            grouped_features, grouped_xyz = self.grouper(
+                xyz, new_xyz, features
+            )  # (B, C, npoint, nsample)
+        else:
+            grouped_features, grouped_xyz, unique_cnt = self.grouper(
+                xyz, new_xyz, features
+            )  # (B, C, npoint, nsample), (B,3,npoint,nsample), (B,npoint)
 
-        self.SA4 = PointnetSAModuleVotes(
-            npoint=16,
-            radius=0.8,
-            nsample=16,
-            mlp=[256, 128, 128, 256],
-            use_xyz=True,
-            normalize_xyz=True
-        )
+        new_features = self.mlp_module(
+            grouped_features
+        )  # (B, mlp[-1], npoint, nsample)
+        if self.pooling == 'max':
+            new_features = F.max_pool2d(
+                new_features, kernel_size=[1, new_features.size(3)]
+            )  # (B, mlp[-1], npoint, 1)
+        elif self.pooling == 'avg':
+            new_features = F.avg_pool2d(
+                new_features, kernel_size=[1, new_features.size(3)]
+            )  # (B, mlp[-1], npoint, 1)
+        elif self.pooling == 'rbf':
+            # Use radial basis function kernel for weighted sum of features (normalized by nsample and sigma)
+            # Ref: https://en.wikipedia.org/wiki/Radial_basis_function_kernel
+            rbf = torch.exp(-1 * grouped_xyz.pow(2).sum(1,keepdim=False) / (self.sigma**2) / 2) # (B, npoint, nsample)
+            new_features = torch.sum(new_features * rbf.unsqueeze(1), -1, keepdim=True) / float(self.nsample) # (B, mlp[-1], npoint, 1)
+        new_features = new_features.squeeze(-1)  # (B, mlp[-1], npoint)
 
-        self.FP1 = PointnetFPModule(mlp=[256+256, 256, 256])
-        self.FP2 = PointnetFPModule(mlp=[128+256, 128, 256])
+        if not self.ret_unique_cnt:
+            return new_xyz, new_features, inds
+        else:
+            return new_xyz, new_features, inds, unique_cnt
 
-    def _break_up_pc(self, pc):
-        xyz = pc[..., 0:3].contiguous()
-        features = (
-            pc[..., 3:].transpose(1, 2).contiguous()
-            if pc.size(-1) > 3 else None
-        )
 
-        return xyz, features
+def compute_mov_loss(pred_mov, mov_truth):
+    Class_Loss = nn.BCEWithLogitsLoss()
+    return Class_Loss(pred_mov, mov_truth.float())
 
-    def forward(self, pointcloud:torch.cuda.FloatTensor, end_points=None):
 
-        if not end_points: end_points = {}
-        batch_size = pointcloud.shape[0]
+def compute_score_loss(pred_score, score_truth):
+    Class_Loss = nn.BCEWithLogitsLoss()
+    return Class_Loss(pred_score, score_truth.float())
 
-        xyz, features = self._break_up_pc(pointcloud)
 
-        xyz, features, fps_inds = self.SA1(xyz, features)
-        end_points['SA1_inds'] = fps_inds
-        end_points['SA1_xyz'] = xyz
-        end_points['SA1_features'] = features
+def compute_type_loss(pred_type, type_truth):
+    Class_Loss = nn.BCEWithLogitsLoss()
+    return Class_Loss(pred_type, type_truth.unsqueeze(-1).float())
 
-        xyz, features, fps_inds = self.SA2(xyz, features)
-        end_points['SA2_inds'] = fps_inds
-        end_points['SA2_xyz'] = xyz
-        end_points['SA2_features'] = features
 
-        xyz, features, fps_inds = self.SA3(xyz, features)
-        end_points['SA3_xyz'] = xyz
-        end_points['SA3_features'] = features
+def compute_per_point_state_loss(pred_state, state_truth):
+    pred_stat_mean = torch.mean(pred_state, dim=1)
+    MAE_loss = F.l1_loss(pred_stat_mean, state_truth.unsqueeze(-1))
+    return MAE_loss
 
-        xyz, features, fps_inds = self.SA4(xyz, features)
-        end_points['SA4_xyz'] = xyz
-        end_points['SA4_features'] = features
 
-        features = self.FP1(end_points['SA3_xyz'], end_points['SA4_xyz'], end_points['SA3_features'], end_points['SA4_features'])
-        features = self.FP2(end_points['SA2_xyz'], end_points['SA3_xyz'], end_points['SA2_features'], features)
-        end_points['FP2_features'] = features
-        end_points['FP2_xyz'] = end_points['SA2_xyz']
-        num_seed = end_points['FP2_xyz'].shape[1]
-        end_points['FP2_inds'] = end_points['SA1_inds'][:,0:num_seed]
-        return end_points
+def compute_per_point_axis_loss(pred_axis, pred_points, axis_truth, pos_truth):
+    aggregated_pos = torch.mean(pred_points, dim=1)
+    axis_point_to_pred = aggregated_pos - pos_truth
+    cross_product = torch.cross(axis_point_to_pred, axis_truth)
+    distance_loss = torch.norm(cross_product, dim=-1) / torch.norm(axis_truth, dim=-1)
+    distance_loss_mean = torch.mean(distance_loss)
+    direction_loss = torch.norm(pred_axis - axis_truth.unsqueeze(1), dim=-1)
+    direction_loss_mean = torch.mean(direction_loss, dim=1)
+    return torch.mean(distance_loss_mean + direction_loss_mean, dim=0)
+
+
+def get_loss(pred, label, train_head, weight_dict):
+    loss = 0.
+    if train_head == 'Mov':
+        loss = compute_mov_loss(pred['mov'], label['mov'])
+    elif train_head == 'Para':
+        type_loss = compute_type_loss(pred['type'], label['type'])
+        state_loss = compute_per_point_state_loss(pred['state'], label['state'])
+        joint_axis_loss = compute_per_point_axis_loss(pred['ori'], pred['pos'], label['ori'], label['pos'], weight_dict)
+        loss = type_loss * weight_dict['type'] + state_loss * weight_dict['state'] + joint_axis_loss
+    elif train_head == 'Score':
+        loss = compute_score_loss(pred['score'], label['score'])
+    return loss
+

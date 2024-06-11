@@ -35,6 +35,7 @@ def merge_new_config(config, new_config):
     return config
 
 def cfg_from_yaml_file(cfg_file):
+    print(cfg_file)
     config = EasyDict()
     with open(cfg_file, 'r') as f:
         try:

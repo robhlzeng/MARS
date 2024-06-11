@@ -7,10 +7,18 @@ In this work, we introduce MARS, a novel framework for articulated object charac
 </div>
 
 ## Installation
+PyTorch >= 1.7.0 < 1.11.0; python >= 3.7; CUDA >= 9.0; GCC >= 4.9; torchvision;
 ```
-cd pointnet2
-python setup.py install
+pip install -r requirements.txt
 ```
-
+```
+# PointNet++
+pip install "git+https://github.com/erikwijmans/Pointnet2_PyTorch.git#egg=pointnet2_ops&subdirectory=pointnet2_ops_lib"
+```
+## Training
+The PartNet-Mobility dataset was downloaded from [here](https://sapien.ucsd.edu/downloads) and imported into the SAPIEN simulation environment to extract labels.
+```
+CUDA_VISIBLE_DEVICES=<GPU> python main.py --config cfgs/train.yaml --exp_name <output_file_name>
+```
 ## Reference
 
